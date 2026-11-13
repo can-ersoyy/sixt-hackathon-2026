@@ -41,7 +41,7 @@ Our team (me and some gemini models) split the pipeline into multiple stages:
 
 ## Results
 
-Your numbers, measured on held-out data, with a baseline to compare against (for example a naive model). Use the metrics named in your project README. Say honestly what did not work and what the limits are.
+Checkout [EDA.md](EDA.md) for more information on results. You can use a threshold value of `0.95` for score script.
 
 ## How to run
 
