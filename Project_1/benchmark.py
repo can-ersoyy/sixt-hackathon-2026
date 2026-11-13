@@ -14,6 +14,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -109,49 +110,48 @@ async def run_m2_strategy(
 
     # Pass 2 Routing: use complementary modality or second model
     route1 = determine_route(rec, parsed, config)
-    route2_mode = config.get("pass2_strategy", "complementary_or_second_model")
+    model_p2 = config.get("model_pass2") or config.model_text
+
+    cfg_p2_dict = dict(config.to_dict()) if hasattr(config, "to_dict") else {
+        "vlm_max_pages": config.vlm_max_pages,
+        "max_doc_chars": config.max_doc_chars,
+        "chunk_overlap_chars": config.chunk_overlap_chars,
+        "schema_chunk_size": config.schema_chunk_size,
+        "concurrency": config.concurrency,
+        "risk_json_mult": config.get("risk_json_mult", 0.90),
+        "risk_corrupted_mult": config.get("risk_corrupted_mult", 0.85),
+    }
 
     # If Pass 1 used VLM on digital PDF, Pass 2 uses Text model on node tree
     if route1.modality == "vlm" and parsed.doc_type == "digital_pdf":
-        cfg_pass2 = PipelineConfig(route_mode="text", concurrency=config.concurrency)
-        route2 = determine_route(rec, parsed, cfg_pass2)
+        cfg_p2_dict["route_mode"] = "text"
+        cfg_p2_dict["model_text"] = model_p2
     else:
-        # Use second model or text fallback
-        model_p2 = config.get("model_pass2") or config.model_text
-        route2 = RouteDecision(
-            modality=route1.modality,
-            model=model_p2,
-            images_b64=route1.images_b64,
-            companion_text=route1.companion_text,
-            doc_chunks=route1.doc_chunks,
-            reason=f"Pass 2 verification with {model_p2}",
-            primary_path=route1.primary_path,
-        )
+        cfg_p2_dict["route_mode"] = config.route_mode
+        cfg_p2_dict["model_text"] = model_p2
+        cfg_p2_dict["model_vlm"] = model_p2
 
-    # Execute Pass 2 for candidate fields
-    fields_desc = describe_schema(sub_schema)
-    doc_for_p2 = (
-        parsed.raw_text if parsed.doc_type == "digital_pdf"
-        else (route2.companion_text or (parsed.raw_text[:180000] if parsed.raw_text else ""))
-    )
-    prompt = EXTRACTION_PROMPT.format(
-        fields=fields_desc,
-        document=doc_for_p2,
-    )
-
+    cfg_pass2 = PipelineConfig.from_dict(cfg_p2_dict)
+    rec_p2 = {**rec, "schema": sub_schema}
+    old_cfg_p2 = extractor_pass2.config
+    extractor_pass2.config = cfg_pass2
     try:
-        reply2 = await extractor_pass2.call_llm_async(
-            prompt,
-            images_b64=route2.images_b64 if route2.modality == "vlm" else None,
-            model=route2.model,
-        )
-        preds2 = parse_json_reply(reply2)
+        res2 = await extractor_pass2.extract_record_async(rec_p2, parsed)
+        preds2 = res2.get("fields", {})
     except Exception as e:
         logger.warning("Pass 2 failed on %s: %s", rec["doc_id"], e)
         preds2 = {}
+    finally:
+        extractor_pass2.config = old_cfg_p2
 
     boost_target = config.get("boost_conf", 0.97)
     penalty_mult = config.get("penalty_mult", 0.40)
+    risk_json_mult = config.get("risk_json_mult", 0.90)
+    risk_corrupted_mult = config.get("risk_corrupted_mult", 0.85)
+    doc_id = rec.get("doc_id", "")
+    is_corrupted = "_corrupted" in doc_id or "corrupted" in (rec.get("tags") or [])
+    is_scanned = parsed.doc_type in ("scanned_pdf", "image")
+    raw_norm = " ".join(parsed.raw_text.split()).lower() if parsed.raw_text else ""
 
     # Compare Pass 1 and Pass 2 with 5_score's values_match
     for fname, f1 in non_null_fields.items():
@@ -168,7 +168,33 @@ async def run_m2_strategy(
             is_match = values_match(v1, v2, kind)
 
         if is_match:
-            new_conf = max(c1, c2, boost_target)
+            # Respect verifier caps from either pass (e.g. cap_fuzzy_only=0.88, cap_reformatted_string=0.88)
+            if c1 < 0.90 or c2 < 0.90:
+                new_conf = min(0.92, max(c1, c2))
+            else:
+                new_conf = min(0.98, max(c1, c2, boost_target))
+
+            # Enforce risk caps that must never be overwritten by consensus boost
+            if kind == "json":
+                new_conf = min(new_conf, risk_json_mult)
+            if is_corrupted:
+                new_conf = min(new_conf, risk_corrupted_mult)
+            if kind == "span":
+                # CUAD span_f1 >= 0.80 boundary/alias sensitivity + semantic false positives
+                new_conf = min(new_conf, 0.90)
+            if is_scanned and new_conf >= 0.95:
+                # Require Docling OCR token-boundary confirmation on scanned docs to clear 0.95
+                v1_norm = " ".join(str(v1).split()).lower()
+                ocr_confirmed = bool(
+                    v1_norm
+                    and not isinstance(v1, bool)
+                    and re.search(
+                        r"(?<![A-Za-z0-9$\-])" + re.escape(v1_norm) + r"(?![A-Za-z0-9\-])",
+                        raw_norm,
+                    )
+                )
+                if not ocr_confirmed:
+                    new_conf = min(new_conf, 0.92)
         else:
             new_conf = min(c1, c2 if v2 is not None else c1) * penalty_mult
             if penalty_mult == 0.0 or new_conf <= 0.0:
