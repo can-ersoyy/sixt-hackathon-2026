@@ -339,7 +339,8 @@ def is_non_null_value(val: Any) -> bool:
         return True  # Boolean False is a valid prediction (e.g. unchecked checkbox)
     if isinstance(val, str):
         s = val.strip()
-        if not s or s.lower() == "null":
+        sl = s.lower()
+        if not sl or sl in ("null", "none", "n/a", "na", "not applicable", "not specified") or sl.startswith("none ("):
             return False
         return True
     return True

@@ -76,30 +76,36 @@ DEFAULT_SIXT_URL = "https://llm.orange.sixt.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_CHARS_PROMPT = 90_000
 
+CUAD_SHORT_SPAN_FIELDS = {
+    "Document Name",
+    "Parties",
+    "Agreement Date",
+    "Effective Date",
+}
+
 EXTRACTION_PROMPT = """You are an expert, precision-first information extraction model.
 Extract the fields below from the document. Reply with ONE valid JSON object and nothing else.
 
 Output format:
 {{
   "<field_name>": {{
-    "quote": "<exact verbatim snippet from doc or null>",
+    "quote": "<exact verbatim snippet from document or null>",
     "value": <string, number, boolean, JSON array/object, or null>,
-    "confidence": <float 0.0 to 1.0>,
-    "evidence_span": "<canonical_path_tag or null>"
+    "confidence": <float 0.0 to 1.0>
   }},
   ...
 }}
 
 Strict Extraction Rules:
-1. ATOMIC EXTRACTION: Never merge adjacent fields (e.g. keep town, county, and state separate).
+1. ATOMIC EXTRACTION: Follow each field's exact description and formatting rules. Never merge adjacent fields.
 2. DOTTED-LEADER FORMS: Include both row label and value in "quote" to prevent vertical row-shifting.
-3. CUAD / LEGAL SPANS ([span]): For fields marked [span], copy the COMPLETE verbatim sentence or contractual clause (do NOT extract just a partial entity fragment like 'State of New York' or 'April 1, 1999' alone; copy the entire verbatim sentence or clause). If multiple clauses apply, join them with " | ". Do NOT extract definitions as operative clauses.
-4. CHECKBOXES (boolean): Return true if marked, false if clearly unchecked on a visible page, null if the page or section is absent.
-5. ABSOLUTE VERBATIM GROUNDING: Copy values EXACTLY as printed in the document. Do not summarize, guess, or calculate.
-6. ABSTENTION POLICY (CRITICAL): If a field is not explicitly present or cannot be identified with 100% certainty, return "value": null, "confidence": 0.0, "quote": null, "evidence_span": null.
-   CRITICAL COST ASYMMETRY: A wrong or hallucinated accepted value costs 100 times more than a null. Only assign confidence >= 0.95 when absolutely certain and verbatim.
-7. EVIDENCE SPAN: "evidence_span" must be ONLY the canonical location tag of the node containing the value, e.g. "[sec-1/p-2/s-5]". Do NOT quote text inside evidence_span.
-8. CRITICAL FOR LEGAL CLAUSES: Do NOT extract clauses that explicitly negate or disclaim the requested right/restriction (e.g., 'no third-party beneficiaries', 'not intended to confer upon any person... rights', 'no exclusivity', 'no non-compete'). If the contract states the right or restriction does NOT exist, return null.
+3. CUAD SHORT SPANS ([short_span]): For Document Name, Parties, Agreement Date, Effective Date, extract ONLY the exact title, party names/aliases (separated by " | "), or date string as printed — NOT the full preamble sentence.
+4. CUAD CLAUSE SPANS ([clause_span]): Copy the COMPLETE verbatim sentence(s) or contractual clause from the document (do NOT extract a short fragment like 'State of New York' or 'one year' alone, and NEVER return true/false for a [clause_span] field). If multiple clauses apply, join them with " | ".
+5. CHECKBOXES (boolean): Return true if marked, false if clearly unchecked on a visible page, null if the page or section is absent (unless description specifies TWO-STATE).
+6. ABSOLUTE VERBATIM GROUNDING: Copy values EXACTLY as printed in the document. Do not summarize, paraphrase, guess, or calculate.
+7. ABSTENTION POLICY (CRITICAL): If a field is not explicitly present or cannot be identified with high certainty, return "value": null, "confidence": 0.0, "quote": null. NEVER return "None", "N/A", "Not applicable", or "None (...)" as a string — use JSON null.
+   COST ASYMMETRY: A wrong accepted value costs 100x more than a null. Only assign confidence >= 0.95 when 100% certain, unambiguous, and verbatim. Use 0.70-0.85 if partially uncertain.
+8. NEGATED / DISCLAIMED CLAUSES: Do NOT extract clauses that explicitly negate or disclaim the requested right/restriction (e.g., 'no third-party beneficiaries', 'not intended to confer upon any person... rights', 'as-is / no warranties', 'non-exclusive' when asked for Exclusivity). If the contract states the right/restriction does NOT exist, return null.
 
 Fields to extract:
 {fields}
@@ -131,16 +137,68 @@ Return ONLY ONE valid JSON object.
 """
 
 
+def _format_type_hint(spec: dict, defs: dict, depth: int = 0) -> str:
+    """Formats JSON schema type/structure/enum/items concisely for LLM prompts."""
+    if not isinstance(spec, dict) or depth > 2:
+        return ""
+    if "$ref" in spec:
+        ref_name = str(spec["$ref"]).split("/")[-1]
+        if ref_name in defs:
+            return _format_type_hint(defs[ref_name], defs, depth + 1)
+        return ref_name
+
+    if "anyOf" in spec and isinstance(spec["anyOf"], list):
+        parts = [_format_type_hint(sub, defs, depth) for sub in spec["anyOf"]]
+        parts = [p for p in parts if p and p != "null"]
+        return "|".join(parts) if parts else ""
+
+    t = spec.get("type")
+    if isinstance(t, list):
+        t = "|".join(x for x in t if x != "null")
+
+    if "enum" in spec and isinstance(spec["enum"], list):
+        vals = ", ".join(repr(v) for v in spec["enum"][:10])
+        return f"enum({vals})"
+
+    if t == "array" and isinstance(spec.get("items"), dict):
+        item_hint = _format_type_hint(spec["items"], defs, depth + 1)
+        return f"array<{item_hint}>" if item_hint else "array"
+
+    if t == "object" and isinstance(spec.get("properties"), dict):
+        req = set(spec.get("required", []))
+        fields_str = []
+        for k, v in list(spec["properties"].items())[:25]:
+            sub_t = _format_type_hint(v, defs, depth + 1) or v.get("type") or "any"
+            star = "*" if k in req else ""
+            fields_str.append(f"{k}{star}: {sub_t}")
+        return "{" + ", ".join(fields_str) + "}"
+
+    return str(t) if t else ""
+
+
 def describe_schema(schema: dict) -> str:
-    """Formats schema properties into concise field descriptions."""
+    """Formats schema properties into detailed, unambiguous field descriptions."""
     out = []
     properties = schema.get("properties", {})
+    defs = schema.get("$defs", {}) if isinstance(schema.get("$defs"), dict) else {}
+
     for name, spec in properties.items():
-        desc = spec.get("description") or spec.get("title") or spec.get("type") or ""
+        if not isinstance(spec, dict):
+            out.append(f"- {name}")
+            continue
+        desc = spec.get("description") or spec.get("title") or ""
         kind = spec.get("x-normalizer")
-        kind_str = f" [{kind}]" if kind else ""
-        desc_str = f": {str(desc)[:250]}" if desc else ""
-        out.append(f"- {name}{kind_str}{desc_str}")
+        if kind == "span":
+            kind_str = " [short_span]" if name in CUAD_SHORT_SPAN_FIELDS else " [clause_span]"
+        elif kind:
+            kind_str = f" [{kind}]"
+        else:
+            kind_str = ""
+
+        type_hint = _format_type_hint(spec, defs)
+        type_str = f" ({type_hint})" if type_hint and type_hint != kind else ""
+        desc_str = f": {str(desc)[:1500]}" if desc else ""
+        out.append(f"- {name}{kind_str}{type_str}{desc_str}")
     return "\n".join(out)
 
 
@@ -355,12 +413,17 @@ class Extractor:
         for sub_s in sub_schemas:
             fields_desc = describe_schema(sub_s)
             if route.modality == "vlm":
-                doc_text = route.companion_text or ""
+                doc_text = parsed.raw_text if parsed.doc_type == "digital_pdf" else (route.companion_text or "")
                 prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=doc_text)
                 reply = self.call_llm(prompt, images_b64=route.images_b64, model=route.model)
                 sub_preds.append(parse_json_reply(reply))
             else:
-                chunks = route.doc_chunks or [parsed.layout_text]
+                clean_text = parsed.raw_text or parsed.layout_text
+                chunks = chunk_document_text(
+                    clean_text,
+                    max_chars=self.config.max_doc_chars,
+                    overlap_chars=self.config.chunk_overlap_chars,
+                )
                 if len(chunks) > 1:
                     chunk_preds = []
                     for chunk in chunks:
@@ -470,12 +533,17 @@ class AsyncExtractor:
         fields_desc = describe_schema(sub_s)
 
         if route.modality == "vlm":
-            doc_text = route.companion_text or ""
+            doc_text = parsed.raw_text if parsed.doc_type == "digital_pdf" else (route.companion_text or "")
             prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=doc_text)
             reply = await self.call_llm_async(prompt, images_b64=route.images_b64, model=route.model)
             return parse_json_reply(reply)
 
-        chunks = route.doc_chunks or [parsed.layout_text]
+        clean_text = parsed.raw_text or parsed.layout_text
+        chunks = chunk_document_text(
+            clean_text,
+            max_chars=self.config.max_doc_chars,
+            overlap_chars=self.config.chunk_overlap_chars,
+        )
         if len(chunks) > 1:
             chunk_tasks = []
             for chunk in chunks:

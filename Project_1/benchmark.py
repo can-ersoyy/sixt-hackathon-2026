@@ -130,9 +130,13 @@ async def run_m2_strategy(
 
     # Execute Pass 2 for candidate fields
     fields_desc = describe_schema(sub_schema)
+    doc_for_p2 = (
+        parsed.raw_text if parsed.doc_type == "digital_pdf"
+        else (route2.companion_text or (parsed.raw_text[:180000] if parsed.raw_text else ""))
+    )
     prompt = EXTRACTION_PROMPT.format(
         fields=fields_desc,
-        document=route2.companion_text or (route2.doc_chunks[0] if route2.doc_chunks else parsed.layout_text[:80000]),
+        document=doc_for_p2,
     )
 
     try:
@@ -214,7 +218,7 @@ async def run_m3_strategy(
         }
         for k, v in non_null_fields.items()
     }
-    critic_doc = parsed.layout_text[:60000]
+    critic_doc = parsed.raw_text[:180000] if parsed.raw_text else parsed.layout_text[:180000]
     prompt = CRITIC_PROMPT.format(
         document=critic_doc,
         candidates=json.dumps(candidates, indent=2),

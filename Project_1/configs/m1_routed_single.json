@@ -7,8 +7,8 @@
   "chunk_overlap_chars": 5000,
   "schema_chunk_size": 20,
   "concurrency": 10,
-  "model_text": "gemini-3.5-flash-lite",
-  "model_vlm": "gemini-3.5-flash-lite",
+  "model_text": "vertex_ai/gemini-3.5-flash-lite",
+  "model_vlm": "vertex_ai/gemini-3.5-flash-lite",
   "risk_json_mult": 0.90,
   "risk_corrupted_mult": 0.85
 }

@@ -76,8 +76,8 @@ class VerifierConfig:
     """Configuration thresholds and multipliers for verification & calibration."""
     risk_json_mult: float = 0.90
     risk_corrupted_mult: float = 0.85
-    grounding_fuzzy_threshold: float = 75.0
-    cuad_span_fuzzy_threshold: float = 80.0
+    grounding_fuzzy_threshold: float = 85.0
+    cuad_span_fuzzy_threshold: float = 95.0
     ungrounded_penalty: float = 0.20
     financial_boost: float = 0.03
     financial_penalty: float = 0.50
@@ -153,8 +153,8 @@ def verify_and_calibrate(
     cfg = config if isinstance(config, VerifierConfig) else VerifierConfig(
         risk_json_mult=_get_cfg(config, "risk_json_mult", 0.90),
         risk_corrupted_mult=_get_cfg(config, "risk_corrupted_mult", 0.85),
-        grounding_fuzzy_threshold=_get_cfg(config, "grounding_fuzzy_threshold", 75.0),
-        cuad_span_fuzzy_threshold=_get_cfg(config, "cuad_span_fuzzy_threshold", 80.0),
+        grounding_fuzzy_threshold=_get_cfg(config, "grounding_fuzzy_threshold", 85.0),
+        cuad_span_fuzzy_threshold=_get_cfg(config, "cuad_span_fuzzy_threshold", 95.0),
         ungrounded_penalty=_get_cfg(config, "ungrounded_penalty", 0.20),
         financial_boost=_get_cfg(config, "financial_boost", 0.03),
         financial_penalty=_get_cfg(config, "financial_penalty", 0.50),
@@ -166,13 +166,13 @@ def verify_and_calibrate(
     doc_id = rec.get("doc_id", "")
     tags = rec.get("tags") or []
     is_corrupted = (
-        parsed.doc_type == "scanned_pdf"
-        or "_corrupted" in doc_id
+        "_corrupted" in doc_id
         or "corrupted" in tags
     )
     raw_text_clean = (
         len(parsed.raw_text.strip()) >= 20
-        and not ("_corrupted" in doc_id or "corrupted" in tags)
+        and parsed.doc_type not in ("scanned_pdf", "image")
+        and not is_corrupted
     )
 
     calibrated_fields: Dict[str, dict] = {}
@@ -180,7 +180,10 @@ def verify_and_calibrate(
 
     # Stage 1: Individual Field Grounding & Calibration
     for field_name, field_data in fields.items():
-        field_out = dict(field_data)
+        if isinstance(field_data, dict):
+            field_out = dict(field_data)
+        else:
+            field_out = {"value": field_data, "confidence": 0.5}
         val = field_out.get("value")
         raw_conf = float(field_out.get("confidence", 0.0) if field_out.get("confidence") is not None else 0.0)
         evidence_span = field_out.get("evidence_span")
@@ -192,8 +195,16 @@ def verify_and_calibrate(
         reasons: List[str] = []
         conf = raw_conf
 
-        # 1. Null / Empty handling
-        if val is None or val == "":
+        # 1. Null / Empty / Placeholder handling
+        val_clean_str = str(val).strip() if val is not None else ""
+        val_clean_lower = val_clean_str.lower()
+        is_placeholder = (
+            val is None
+            or val_clean_str == ""
+            or val_clean_lower in ("null", "none", "n/a", "na", "not applicable", "not specified", "unknown")
+            or val_clean_lower.startswith("none (")
+        )
+        if is_placeholder:
             field_out["value"] = None
             field_out["confidence"] = 0.0
             calibrated_fields[field_name] = field_out
@@ -210,14 +221,62 @@ def verify_and_calibrate(
                 )
             continue
 
+        # 1b. Reject boolean predictions on CUAD span fields & negated CUAD clauses
+        if kind == "span":
+            if isinstance(val, bool) or val_clean_lower in ("true", "false"):
+                field_out["value"] = None
+                field_out["confidence"] = 0.0
+                calibrated_fields[field_name] = field_out
+                field_reasons[field_name] = ["span_boolean_rejected"]
+                continue
+
+            negated_clause = False
+            if field_name == "Third Party Beneficiary" and (
+                "not intended to confer" in val_clean_lower
+                or "no third-party beneficiar" in val_clean_lower
+                or "no third party beneficiar" in val_clean_lower
+                or ("sole benefit of the parties" in val_clean_lower and "nothing herein" in val_clean_lower)
+            ):
+                negated_clause = True
+            elif field_name == "Exclusivity" and (
+                "no exclusivity" in val_clean_lower
+                or (
+                    ("non-exclusive" in val_clean_lower or "nonexclusive" in val_clean_lower)
+                    and not re.search(r"\bexclusive\b", val_clean_lower.replace("non-exclusive", "").replace("nonexclusive", ""))
+                )
+            ):
+                negated_clause = True
+            elif field_name == "Warranty Duration" and (
+                ("no warrant" in val_clean_lower or "as-is" in val_clean_lower or "as is" in val_clean_lower)
+                and not re.search(r"\b\d+\b|\b(day|month|year|week)s?\b", val_clean_lower)
+            ):
+                negated_clause = True
+            elif field_name == "Change Of Control" and (
+                ("shall not be considered" in val_clean_lower or "not constitute an assignment" in val_clean_lower or "not be deemed an assignment" in val_clean_lower)
+                and "terminat" not in val_clean_lower
+                and "consent" not in val_clean_lower
+            ):
+                negated_clause = True
+
+            if negated_clause:
+                field_out["value"] = None
+                field_out["confidence"] = 0.0
+                calibrated_fields[field_name] = field_out
+                field_reasons[field_name] = ["cuad_negated_clause_rejected"]
+                continue
+
         # 2. Checkbox Exception
         # If value in ("false", False, "true", True) or property is boolean:
         # do NOT penalize value in ("false", False) for lacking a quote or raw-text match
         is_bool_val = (
             isinstance(val, bool)
-            or str(val).lower() in ("true", "false")
+            or val_clean_lower in ("true", "false")
         )
-        is_bool_prop = (prop_type == "boolean" or kind == "boolean")
+        any_of_types = [
+            sub.get("type") for sub in prop.get("anyOf", [])
+            if isinstance(sub, dict)
+        ] if isinstance(prop.get("anyOf"), list) else []
+        is_bool_prop = (prop_type == "boolean" or kind == "boolean" or "boolean" in any_of_types)
         is_boolean = is_bool_val or is_bool_prop
         is_unchecked_checkbox = is_boolean and (
             val in (False, "false", "False")
@@ -289,14 +348,17 @@ def verify_and_calibrate(
 
         # 4. Document Raw Text Grounding Check
         doc_grounded = False
+        fuzzy_only = False
+        raw_norm = " ".join(parsed.raw_text.split()).lower()
+        val_norm = " ".join(val_str.split()).lower()
+        quote_norm = " ".join(quote_str.split()).lower()
+
         if is_unchecked_checkbox:
             # Checkbox Exception: do NOT penalize value in ("false", False)
             doc_grounded = True
             reasons.append("checkbox_unchecked_exempt")
         elif kind == "span":
             # For CUAD span fields (x-normalizer == "span"):
-            # If value contains " | ", split by " | " and verify each segment aligns with parsed.raw_text
-            raw_lower = parsed.raw_text.lower()
             if " | " in val_str:
                 segments = [s.strip() for s in val_str.split(" | ") if s.strip()]
                 if not segments:
@@ -304,12 +366,18 @@ def verify_and_calibrate(
                 else:
                     seg_matches: List[bool] = []
                     for seg in segments:
-                        seg_l = seg.lower()
-                        if seg_l in raw_lower:
+                        seg_n = " ".join(seg.split()).lower()
+                        if seg_n in raw_norm:
                             seg_matches.append(True)
+                        elif len(seg_n) >= 15:
+                            ratio = fuzz.partial_ratio(seg_n, raw_norm)
+                            if ratio >= cfg.cuad_span_fuzzy_threshold:
+                                seg_matches.append(True)
+                                fuzzy_only = True
+                            else:
+                                seg_matches.append(False)
                         else:
-                            ratio = fuzz.partial_ratio(seg_l, raw_lower)
-                            seg_matches.append(ratio >= cfg.cuad_span_fuzzy_threshold)
+                            seg_matches.append(False)
 
                     if all(seg_matches):
                         doc_grounded = True
@@ -325,35 +393,48 @@ def verify_and_calibrate(
                         reasons.append("cuad_no_spans_grounded")
             else:
                 # Single span
-                val_l = val_str.lower()
-                if val_l in raw_lower:
+                if val_norm and val_norm in raw_norm:
                     doc_grounded = True
                     reasons.append("cuad_single_span_exact")
-                else:
-                    ratio = fuzz.partial_ratio(val_l, raw_lower)
+                elif len(val_norm) >= 15:
+                    ratio = fuzz.partial_ratio(val_norm, raw_norm)
                     if ratio >= cfg.cuad_span_fuzzy_threshold:
                         doc_grounded = True
+                        fuzzy_only = True
                         reasons.append(f"cuad_single_span_fuzzy({ratio:.1f})")
                     else:
                         doc_grounded = False
                         reasons.append(f"cuad_single_span_ungrounded({ratio:.1f})")
+                else:
+                    doc_grounded = False
+                    reasons.append("cuad_single_span_too_short_ungrounded")
+
+            # Short-fragment guardrail for CUAD clause fields (excludes short metadata fields)
+            if doc_grounded and field_name not in ("Document Name", "Parties", "Agreement Date", "Effective Date"):
+                if len(val_str) < 25:
+                    conf = min(conf * 0.50, 0.45)
+                    reasons.append("cuad_clause_fragment_penalty")
+            if doc_grounded and field_name == "Renewal Term":
+                if not any(w in val_clean_lower for w in ("renew", "extend", "extension", "successive", "additional")):
+                    conf = min(conf, 0.70)
+                    reasons.append("cuad_renewal_keyword_missing")
         else:
             # Non-span fields
-            raw_lower = parsed.raw_text.lower()
-            val_lower = val_str.lower()
-            quote_lower = quote_str.lower()
-
-            if val_lower and val_lower in raw_lower:
+            if val_norm and val_norm in raw_norm:
                 doc_grounded = True
                 reasons.append("doc_exact_match")
-            elif quote_lower and quote_lower in raw_lower:
+            elif quote_norm and quote_norm in raw_norm:
                 doc_grounded = True
                 reasons.append("doc_quote_exact_match")
+                if kind == "string" and not is_boolean and len(val_norm) >= 4:
+                    # Value was reformatted relative to verbatim quote -> cap below 0.95
+                    conf = min(conf, 0.88)
+                    reasons.append("cap_reformatted_string")
             elif node_grounded:
                 # Grounded in indexed node tree
                 doc_grounded = True
                 reasons.append("doc_node_tree_match")
-            elif is_boolean and any(w in raw_lower for w in re.split(r"[\W_]+", field_name.lower()) if len(w) > 2):
+            elif is_boolean and any(w in raw_norm for w in re.split(r"[\W_]+", field_name.lower()) if len(w) > 2):
                 # Boolean field name exists on page
                 doc_grounded = True
                 reasons.append("checkbox_field_present")
@@ -382,26 +463,26 @@ def verify_and_calibrate(
                     doc_grounded = True
                     reasons.append("doc_normalized_match")
                 else:
-                    # Fuzzy match
-                    r_val = fuzz.partial_ratio(val_lower, raw_lower) if val_lower else 0.0
-                    r_quote = fuzz.partial_ratio(quote_lower, raw_lower) if quote_lower else 0.0
+                    # Fuzzy match only for sufficiently long strings (>= 8 chars)
+                    r_val = fuzz.partial_ratio(val_norm, raw_norm) if len(val_norm) >= 8 else 0.0
+                    r_quote = fuzz.partial_ratio(quote_norm, raw_norm) if len(quote_norm) >= 8 else 0.0
                     if r_val >= cfg.grounding_fuzzy_threshold or r_quote >= cfg.grounding_fuzzy_threshold:
                         doc_grounded = True
+                        fuzzy_only = True
                         reasons.append(f"doc_fuzzy_match(val={r_val:.1f},quote={r_quote:.1f})")
 
         # 5. Penalize completely ungrounded values
         if not doc_grounded and raw_text_clean:
             conf *= cfg.ungrounded_penalty  # Drop conf *= 0.20
             reasons.append("penalty_ungrounded_in_raw_text")
+        elif fuzzy_only and raw_text_clean and not is_corrupted:
+            # Cap fuzzy-only matches below auto-accept threshold 0.95
+            conf = min(conf, 0.88)
+            reasons.append("cap_fuzzy_only")
 
-        # 6. Check node localization consistency
-        if evidence_span:
-            if node_grounded:
-                reasons.append("node_location_verified")
-            elif doc_grounded:
-                # Value exists in document, but cited node did not contain it
-                conf *= 0.90
-                reasons.append("penalty_node_span_mismatch")
+        # 6. Optional node localization log
+        if evidence_span and node_grounded:
+            reasons.append("node_location_verified")
 
         field_out["confidence"] = conf
         calibrated_fields[field_name] = field_out
@@ -498,12 +579,18 @@ def verify_and_calibrate(
             conf *= cfg.risk_corrupted_mult
             field_reasons[field_name].append(f"risk_corrupted_mult({cfg.risk_corrupted_mult:.2f})")
 
+        # CUAD Parties frequently includes/excludes short defined aliases inconsistently
+        if kind == "span" and field_name == "Parties":
+            conf = min(conf, 0.85)
+            field_reasons[field_name].append("cuad_parties_cap(0.85)")
+
         # Clamp between 0.0 and 1.0, round to 4 decimal places
         conf = max(0.0, min(1.0, conf))
         field_out["confidence"] = round(conf, 4)
 
         if log_verification_detail:
-            raw_c = float(fields[field_name].get("confidence", 0.0) if fields[field_name].get("confidence") is not None else 0.0)
+            orig_f = fields[field_name] if isinstance(fields[field_name], dict) else {}
+            raw_c = float(orig_f.get("confidence", 0.0) if orig_f.get("confidence") is not None else 0.0)
             log_verification_detail(
                 field=field_name,
                 value=field_out.get("value"),
