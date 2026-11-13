@@ -1,5 +1,4 @@
-
-# Submission: 
+# Submission:
 
 ## Authors
 
@@ -12,33 +11,33 @@
 #### Problem
 
 The problem was to improve (or stabilize) the precision of automated information extraction from (unstructured) documents. It includes a tradeoff between human-effort and error caused by automated extractions providing wrong values from documents. If the precision of the automated (via LLMs) extraction is high enough (>99%) it can be seen as an alternative to manual extraction done by humans. Otherwise it can be a more expensive way to do extraction than before, which defeats the purpose of using it in the first place.
+Automated information extraction from unstructured documents (contracts, scanned forms, PDFs, and images) involves an asymmetric tradeoff between human review effort and the cost of silent errors. Under the evaluation cost model, sending an uncertain field to a human costs **1**, whereas accepting a wrong or hallucinated value automatically costs **100**.
+
+Because of this 100:1 penalty, raw extraction accuracy is not enough: automated extraction only beats manual entry when accepted predictions achieve **>99% precision**. If a system is overconfident and lets even a small number of errors slip through, it becomes more expensive than doing the work by hand. The core challenge is therefore **selective prediction**—teaching the system when to say *"I don't know"* and defer to a human.
 
 #### Approach
 
-Our team (me and some gemini models) took this problem in 2 parts.
+Our team (me and some gemini models) split the pipeline into multiple stages:
 
-1) Parsing Documents
-2) Extraction
+1) **Modality Identification & Adaptive Routing**
+   Before parsing, each document is classified by type and length (e.g., page count and whether it is a digital PDF, scan, or image). Short digital PDFs ($\le 5$ pages) and image/scanned pages are routed directly to a Vision-Language Model (VLM), since VLM accuracy degrades on very long multi-page documents ([arxiv.org/abs/2607.29677](https://arxiv.org/abs/2607.29677)). Longer documents are routed to the text pipeline.
+2) **Layout-Aware Parsing & Location Annotations**
+   For longer documents, we parse PDFs and images into structured markdown and tables using [Docling](https://docling.ai/) (with `pypdf`/`pdftotext` fallbacks when needed). Before passing this text to an LLM, we build a  node tree and annotate every block with deterministic location tags such as `[sec-1/p-2/s-3]` or `[sec-5/table-0/row-1]`.
+   Instead of relying on free-form quotes or brittle character offsets, the LLM returns the location tag alongside each extracted value. This lets our verifiers programmatically inspect only the cited region—reducing token cost, speeding up verification, and improving accuracy when a verifier or judge checks ambiguous fields. Large schemas (20+ fields) are also chunked to prevent attention degradation. You can think of this as the word boxes in VLM/OCR grounding.
+3) **Dual-Model Extraction, Grounding & Confidence Gating**
+   LLMs tend to be overconfident—especially on positive extractions—so we do not trust a single model's self-reported confidence. Instead, we run a second, independent model pass (or adversarial critic) to cross-check candidate extractions:
 
-Before we even start with parsing, an identification process takes place. This is to classify the paper according to its length (in pages mostly). The idea here is that, according to a recent study ([arxiv.org/abs/2607.29677](https://arxiv.org/abs/2607.29677)) VLMs perform the best when the page count is not too high (e.g <= 5 pages). If this is the case, we just pass the pdf to a VLM and start the extraction.
-
-If the document is longer, we need to use LLMs. For parsing documents, best practice approach in the industry seems to be a combination of layout aware OCR and VLMs. To simplify this part, the [Docling](https://docling.ai/) tool was used. It turns both images and PDFs into markdown.
-
-Before this markdown is passed to an LLM, we augment it with location annotations. This is a way to simplify the information grounding of extracted values. Instead of providing a made-up format (or a text sequence) from the original text sequence, LLM can alongside any extracted field, provide the location annotation that it found this data from. This location annotation can then be used to programmatically check that part of the original text ony, lowering costs, speeding up the process and improving judge LLM performance in case an LLM is used for ambigous data that can't just be checked with a text search. Some example annotations are: [sec-1/p-2/s-3], [sec-5/table-0/row-1]...
-
-It is known that confidence levels provided by an LLM tend to be overconfident, especially for positive results. Therefore in our approach we don't trust the confidence level of one LLM but also use a second one (a different model) and run the extraction on it as well.
-
-After this part we end up with two values and 
-
-
+- **Grounding check:** Verify that the cited location tag exists and that the extracted value is grounded in that section's source text.
+- **Cross-model consensus:** Compare predictions from both models. Agreement with verified grounding boosts confidence (`>= 0.97`), while disagreement, failed grounding, or missing evidence sharply penalizes it.
+- **Confidence thresholding ("I don't know"):** Only values above the calibrated threshold (`0.95`) are accepted automatically. Anything below the threshold—or any field absent from the document—is emitted as `null` / low confidence and routed to human review.
 
 ## Models and why
 
-Any model is allowed, open-weight or closed (API). If your project uses models, show the ones you tried on the same held-out data, and why you chose yours. Add your project-specific settings here too (Project 1: your confidence threshold).
-
-| Model         | Open-weight or closed | Where it runs          | Main metric(s)           | Cost and time per item | Chosen?         |
-| ------------- | --------------------- | ---------------------- | ------------------------ | ---------------------- | --------------- |
-| <name></name> | <open / closed>       | <local / API provider> | <your project's metrics> | <cost, seconds>        | <yes / no, why> |
+| Model                 | Open-weight or closed | Where it runs                                 | Chosen?                                                                                                                 |
+| --------------------- | --------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Gemini 3.5 Flash Lite | closed                | Sixt LiteLLM (Vertex AI) and Google AI Studio | Fast, Not bad multimodal performance                                                                                    |
+| GPT 5.5               | closed                | Sixt LiteLLM                                  | Was one of the best in https://arxiv.org/abs/2607.29677                                                                 |
+| GPT 4o-mini           | closed                | Sixt LiteLLM                                  | Cheaper than GPT 5.5, provides a good candidate for dual consensus setup due to different behavior with the other model |
 
 ## Results
 
@@ -46,12 +45,76 @@ Your numbers, measured on held-out data, with a baseline to compare against (for
 
 ## How to run
 
-Exact commands, from a fresh clone: Python version, install, data location, how to reproduce the results. No secrets: list the environment variables you need (names only).
+### Prerequisites
+
+- **Python:** 3.11+ (project environment uses `>=3.14` in `pyproject.toml`)
+- **Dataset & setup:** Run `setup.sh` from a fresh clone to create `.venv`, install `requirements.txt`, download raw data, and prepare `data/unified/` JSONL files:
+
+```bash
+bash setup.sh --accept-licenses
+. .venv/bin/activate
+```
+
+### Environment variables
+
+Copy `.env.example` to `.env` and set your credentials (never commit `.env`):
+
+- SIXT LiteLLM endpoint: `SIXT_LLM_KEY`, `SIXT_LLM_URL` (and optionally `SIXT_LLM_MODEL`)
+- Or OpenAI-compatible / Gemini endpoint: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`
+- Optional logging: `LOG_LEVEL`, `PIPELINE_LOG_FILE`
+
+### Run extraction and score
+
+1. **Run the pipeline on a dataset (`stage1_pipeline/extractor.py`):**
+
+```bash
+.venv/bin/python3 stage1_pipeline/extractor.py \
+    --data data/unified/dev_mini.jsonl \
+    --out preds.jsonl \
+    --concurrency 10
+```
+
+*(For an offline regex/keyword fallback with zero LLM calls, add `--mode offline`.)*
+
+2. **Compare strategies side-by-side (`benchmark.py`):**
+
+```bash
+.venv/bin/python3 benchmark.py \
+    --data data/unified/dev_mini.jsonl \
+    --configs configs/m1_routed_single.json configs/m2_dual_consensus.json configs/m3_critic_verified.json \
+    --out-dir runs/
+```
+
+3. **Score predictions (`5_score.py`):**
+
+```bash
+.venv/bin/python3 5_score.py \
+    --gold data/unified/dev_mini.jsonl \
+    --pred preds.jsonl \
+    --threshold 0.95 \
+    --error-cost 100
+```
+
+4. **Run the hidden script (`run_hidden.sh`):**
+
+```bash
+bash run_hidden.sh <input.jsonl> <output.jsonl>
+```
+
+For example, to test on a small local dataset:
+
+```bash
+bash run_hidden.sh data/unified/dev_mini2.jsonl runs/hidden_preds.jsonl
+```
+
+This runs `benchmark.py` with `configs/m2_dual_consensus.json`, writes predictions to `<output.jsonl>`, and passes `--force` to overwrite any existing checkpoint predictions. Both `<input.jsonl>` and `<output.jsonl>` arguments are required (`set -euo pipefail` will error if either is omitted).
+
+We support providing multiple options via config files. More information can be found at [USAGE.md](USAGE.md)
 
 ## Demo
 
-Path to `submission/demo.mp4` (1 min, under 50 MB) **or** `submission/slides.pdf` (max 5 slides).
+[slides.pdf](submission/slides.pdf)
 
 ## Next steps
 
-What you would do with more time, and how SIXT could use this.
+One of the problems with having a time constraint like this is to test different configurations. There are many options such as `penalty_mul`, `risk_json_mult`, `vlm_max_pages` and so on that highly effects the performance. Model selection is another topic. Results indicate that this solution can be a viable option for this task but requires careful considerations across different domains (costs, latency, coverage etc.)

@@ -288,6 +288,7 @@ async def evaluate_config(
     parsed_docs: Dict[str, ParsedDocument],
     out_dir: Path,
     force: bool = False,
+    out_file_override: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], List[dict], Dict[str, dict]]:
     """Runs a single configuration against the records and computes evaluation metrics."""
     cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -299,7 +300,8 @@ async def evaluate_config(
     logger.info("Description: %s", cfg_data.get("description", ""))
     logger.info("==================================================")
 
-    out_file = out_dir / f"{name}_preds.jsonl"
+    out_file = out_file_override if out_file_override is not None else (out_dir / f"{name}_preds.jsonl")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     done_preds: Dict[str, dict] = {}
     if force and out_file.exists():
         out_file.unlink()
@@ -342,6 +344,16 @@ async def evaluate_config(
     runtime_sec = time.perf_counter() - t0
 
     preds_by_doc = {r["doc_id"]: r["fields"] for r in doc_results}
+
+    has_gold = bool(recs) and all("gold" in r and isinstance(r["gold"], dict) for r in recs)
+    if not has_gold:
+        stats = {
+            "name": name,
+            "has_gold": False,
+            "runtime_sec": round(runtime_sec, 2),
+            "num_docs": len(doc_results),
+        }
+        return stats, [], preds_by_doc
 
     # Evaluate using 5_score collect & curve
     rows = collect(recs, preds_by_doc)
@@ -477,11 +489,17 @@ def main():
     parser.add_argument("--configs", nargs="+", required=True, help="List of JSON config paths")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of documents")
     parser.add_argument("--out-dir", default="runs", help="Output directory for predictions")
+    parser.add_argument("--out", default=None, help="Explicit output JSONL path (valid only with a single config)")
     parser.add_argument("--force", action="store_true", help="Force re-run and overwrite existing checkpoint predictions")
     args = parser.parse_args()
 
+    if args.out and len(args.configs) != 1:
+        print("Error: --out can only be used with a single config in --configs.", file=sys.stderr)
+        sys.exit(1)
+
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not args.out:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     data_path = Path(args.data)
     if not data_path.exists():
@@ -506,22 +524,36 @@ def main():
     all_stats: List[Dict[str, Any]] = []
     fps_by_config: Dict[str, List[dict]] = {}
 
+    out_file_override = Path(args.out) if args.out else None
     for cfg_str in args.configs:
         cfg_file = Path(cfg_str)
         if not cfg_file.exists():
             print(f"Warning: config file {cfg_file} not found, skipping.", file=sys.stderr)
             continue
 
-        stats, fps, _ = asyncio.run(evaluate_config(cfg_file, recs, parsed_docs, out_dir, force=args.force))
+        stats, fps, _ = asyncio.run(
+            evaluate_config(cfg_file, recs, parsed_docs, out_dir, force=args.force, out_file_override=out_file_override)
+        )
         all_stats.append(stats)
         fps_by_config[stats["name"]] = fps
 
-    # Print Side-by-Side Comparison
-    print_comparison_table(all_stats)
+    scored_stats = [s for s in all_stats if s.get("has_gold", True)]
+    if scored_stats:
+        # Print Side-by-Side Comparison
+        print_comparison_table(scored_stats)
 
-    # Print Top 10 False Positives for each configuration
-    for s in all_stats:
-        print_top_false_positives(s["name"], fps_by_config.get(s["name"], []), top_n=10)
+        # Print Top 10 False Positives for each configuration
+        for s in scored_stats:
+            print_top_false_positives(s["name"], fps_by_config.get(s["name"], []), top_n=10)
+    else:
+        for s in all_stats:
+            logger.info(
+                "Inference complete for %s (%d docs in %.2fs) -> %s",
+                s["name"],
+                s.get("num_docs", len(recs)),
+                s["runtime_sec"],
+                args.out or (out_dir / f"{s['name']}_preds.jsonl"),
+            )
 
 
 if __name__ == "__main__":
