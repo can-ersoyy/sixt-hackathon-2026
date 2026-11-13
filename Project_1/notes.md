@@ -1,0 +1,2 @@
+- small papers (use vlm directly)
+- long papers (docling + location annotated text) - 2 llms

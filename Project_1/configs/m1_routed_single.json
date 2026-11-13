@@ -1,0 +1,14 @@
+{
+  "name": "m1_routed_single",
+  "description": "Adaptive VLM (short/scanned) + Node-Tree Text (long/CUAD) + Schema Chunking + Verifiers",
+  "route_mode": "auto",
+  "vlm_max_pages": 5,
+  "max_doc_chars": 180000,
+  "chunk_overlap_chars": 5000,
+  "schema_chunk_size": 20,
+  "concurrency": 10,
+  "model_text": "gemini-3.5-flash-lite",
+  "model_vlm": "gemini-3.5-flash-lite",
+  "risk_json_mult": 0.90,
+  "risk_corrupted_mult": 0.85
+}

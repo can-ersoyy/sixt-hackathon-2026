@@ -1,21 +1,19 @@
-"""Stage 1 Extractor with Provider Routing (LiteLLM & OpenAI) and Node-Tree Grounding.
-
-Uses layout-aware parsed documents from parser.py, requests canonical evidence_span paths
-([sec-1/p-2/s-5]), and validates verbatim grounding against the node subtree and raw text.
+"""Stage 1 Extractor with Adaptive Provider Routing, Async Concurrency,
+Multimodal VLM Support, Document/Schema Chunking, and Calibrated Verification.
 """
 from __future__ import annotations
 
 import argparse
-import base64
+import asyncio
 import json
 import logging
-import mimetypes
 import os
 import re
 import sys
-import urllib.request
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Ensure project root and package directory are in sys.path
 _HERE = Path(__file__).resolve().parent
@@ -28,11 +26,51 @@ from dotenv import load_dotenv
 
 try:
     from stage1_pipeline.parser import ParsedDocument, parse_document
+    from stage1_pipeline.router import (
+        PipelineConfig,
+        RouteDecision,
+        determine_route,
+        chunk_document_text,
+        merge_chunk_predictions,
+        split_schema,
+        merge_schema_predictions,
+    )
+    from stage1_pipeline.verifiers import verify_and_calibrate
+    from stage1_pipeline.logging_utils import (
+        get_logger,
+        log_document_start,
+        log_route_decision,
+        log_llm_request,
+        log_llm_response,
+        log_verification_detail,
+        log_progress,
+        log_stage_banner,
+    )
 except ImportError:
     from parser import ParsedDocument, parse_document
+    from router import (
+        PipelineConfig,
+        RouteDecision,
+        determine_route,
+        chunk_document_text,
+        merge_chunk_predictions,
+        split_schema,
+        merge_schema_predictions,
+    )
+    from verifiers import verify_and_calibrate
+    from logging_utils import (
+        get_logger,
+        log_document_start,
+        log_route_decision,
+        log_llm_request,
+        log_llm_response,
+        log_verification_detail,
+        log_progress,
+        log_stage_banner,
+    )
 
 load_dotenv()
-logger = logging.getLogger(__name__)
+logger = get_logger("stage1_pipeline.extractor")
 
 DEFAULT_SIXT_URL = "https://llm.orange.sixt.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -44,6 +82,7 @@ Extract the fields below from the document. Reply with ONE valid JSON object and
 Output format:
 {{
   "<field_name>": {{
+    "quote": "<exact verbatim snippet from doc or null>",
     "value": <string, number, boolean, JSON array/object, or null>,
     "confidence": <float 0.0 to 1.0>,
     "evidence_span": "<canonical_path_tag or null>"
@@ -51,19 +90,44 @@ Output format:
   ...
 }}
 
-Rules:
-1. Copy values EXACTLY as printed in the document. Do not summarize, guess, or calculate.
-2. If a field is not present or cannot be read with certainty, return "value": null, "confidence": 0.0, "evidence_span": null.
-   CRITICAL: A wrong accepted value costs 100 times more than a null. If unsure, output null.
-3. "evidence_span" must be ONLY the canonical location tag of the node containing the value, e.g. "[sec-1/p-2/s-5]" or "[sec-2/table-0/row-3]".
-   Do NOT quote text inside evidence_span, only output the bracketed location path tag string.
-4. "confidence" is your calibrated certainty that the extracted value is 100% correct and verbatim.
+Strict Extraction Rules:
+1. ATOMIC EXTRACTION: Never merge adjacent fields (e.g. keep town, county, and state separate).
+2. DOTTED-LEADER FORMS: Include both row label and value in "quote" to prevent vertical row-shifting.
+3. CUAD / LEGAL SPANS ([span]): For fields marked [span], copy the COMPLETE verbatim sentence or contractual clause (do NOT extract just a partial entity fragment like 'State of New York' or 'April 1, 1999' alone; copy the entire verbatim sentence or clause). If multiple clauses apply, join them with " | ". Do NOT extract definitions as operative clauses.
+4. CHECKBOXES (boolean): Return true if marked, false if clearly unchecked on a visible page, null if the page or section is absent.
+5. ABSOLUTE VERBATIM GROUNDING: Copy values EXACTLY as printed in the document. Do not summarize, guess, or calculate.
+6. ABSTENTION POLICY (CRITICAL): If a field is not explicitly present or cannot be identified with 100% certainty, return "value": null, "confidence": 0.0, "quote": null, "evidence_span": null.
+   CRITICAL COST ASYMMETRY: A wrong or hallucinated accepted value costs 100 times more than a null. Only assign confidence >= 0.95 when absolutely certain and verbatim.
+7. EVIDENCE SPAN: "evidence_span" must be ONLY the canonical location tag of the node containing the value, e.g. "[sec-1/p-2/s-5]". Do NOT quote text inside evidence_span.
+8. CRITICAL FOR LEGAL CLAUSES: Do NOT extract clauses that explicitly negate or disclaim the requested right/restriction (e.g., 'no third-party beneficiaries', 'not intended to confer upon any person... rights', 'no exclusivity', 'no non-compete'). If the contract states the right or restriction does NOT exist, return null.
 
 Fields to extract:
 {fields}
 
---- DOCUMENT (with Canonical Path Tags) ---
+--- DOCUMENT CONTENT ---
 {document}
+"""
+
+CRITIC_PROMPT = """You are an adversarial information extraction auditor.
+A primary extraction model extracted the candidate values below from the document.
+Your task is to determine whether each candidate value is unambiguously, verbatim supported by the document without guessing or hallucination.
+
+Document:
+{document}
+
+Candidate Extractions to audit:
+{candidates}
+
+For each candidate, respond with:
+{{
+  "<field_name>": {{
+    "supported": true | false,
+    "verbatim_quote": "<exact quote from document or null>",
+    "auditor_confidence": <float 0.0 to 1.0>,
+    "critique": "<short 1-line reason if disputed or supported>"
+  }}
+}}
+Return ONLY ONE valid JSON object.
 """
 
 
@@ -97,11 +161,13 @@ def parse_json_reply(reply: str) -> dict:
 
 
 def is_grounded(value: Any, text: Optional[str]) -> bool:
-    """Verifies that an extracted value is grounded verbatim in source text."""
+    """Verifies that an extracted value is grounded verbatim in source text.
+    Maintained for backward compatibility.
+    """
     if text is None or value is None or isinstance(value, bool):
         return True
     if not isinstance(value, (str, int, float)):
-        return True  # Nested structures (e.g. lists/dicts)
+        return True
     val_str = str(value).strip()
     if not val_str or len(val_str) > 200:
         return True
@@ -109,149 +175,332 @@ def is_grounded(value: Any, text: Optional[str]) -> bool:
     return squash(val_str) in squash(text)
 
 
+def resolve_llm_config(
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """Resolves LLM credentials and endpoints from arguments or environment."""
+    resolved_key = (
+        api_key
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("SIXT_LLM_KEY")
+        or ""
+    )
+    resolved_base = (
+        api_base
+        or os.environ.get("LLM_BASE_URL")
+        or os.environ.get("SIXT_LLM_URL")
+        or DEFAULT_SIXT_URL
+    ).rstrip("/")
+
+    # Normalize OpenAI-compatible endpoint base URL
+    if not (
+        resolved_base.endswith("/v1")
+        or resolved_base.endswith("openai")
+        or "azure" in resolved_base
+        or "googleapis.com" in resolved_base
+    ):
+        resolved_base = resolved_base + "/v1"
+
+    resolved_model = (
+        model
+        or os.environ.get("LLM_MODEL")
+        or os.environ.get("SIXT_LLM_MODEL")
+        or DEFAULT_MODEL
+    )
+    return resolved_key, resolved_base, resolved_model
+
+
 class Extractor:
-    """Unified Extractor supporting LiteLLM and OpenAI provider backends."""
+    """Synchronous / Unified Extractor supporting LiteLLM and OpenAI backends."""
 
     def __init__(
         self,
-        provider: str = "litellm",
+        provider: str = "openai",
         model: Optional[str] = None,
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
+        config: Optional[PipelineConfig] = None,
     ):
         self.provider = provider.lower()
-        self.api_key = (
-            api_key
-            or os.environ.get("SIXT_LLM_KEY")
-            or os.environ.get("LLM_API_KEY")
-        )
-        base = (
-            api_base
-            or os.environ.get("SIXT_LLM_URL")
-            or os.environ.get("LLM_BASE_URL")
-            or DEFAULT_SIXT_URL
-        )
-        # Ensure base URL format
-        base = base.rstrip("/")
-        if not base.endswith("/v1") and "azure" not in base:
-            base = base + "/v1"
-        self.api_base = base
+        self.config = config or PipelineConfig()
+        cfg_model = getattr(self.config, "model_text", None) if self.config else None
+        target_model = model or cfg_model
+        # If config has hardcoded default but LLM_MODEL is explicitly set in env, prefer env
+        if os.environ.get("LLM_MODEL") and target_model in ("gpt-4o-mini", None):
+            target_model = os.environ.get("LLM_MODEL")
 
-        self.model = (
-            model
-            or os.environ.get("SIXT_LLM_MODEL")
-            or os.environ.get("LLM_MODEL")
-            or DEFAULT_MODEL
-        )
-
+        self.api_key, self.api_base, self.model = resolve_llm_config(api_key, api_base, target_model)
         self._openai_client = None
-        if self.provider == "openai":
+        if self.api_key:
             from openai import OpenAI
-            self._openai_client = OpenAI(base_url=self.api_base, api_key=self.api_key or "sk-dummy")
+            self._openai_client = OpenAI(base_url=self.api_base, api_key=self.api_key)
 
-    def call_llm(self, prompt: str) -> str:
-        """Invokes LLM using configured provider (litellm or openai)."""
+    def call_llm(
+        self,
+        prompt: str,
+        images_b64: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        max_retries: int = 3,
+    ) -> str:
+        """Synchronously invokes LLM with text or multimodal messages."""
         if not self.api_key:
             raise ValueError("No API key configured for LLM. Set SIXT_LLM_KEY or LLM_API_KEY.")
 
-        messages = [{"role": "user", "content": prompt}]
+        chosen_model = model or self.model
+        if log_llm_request is not None:
+            log_llm_request(model=chosen_model, prompt_chars=len(prompt), logger=logger)
 
-        if self.provider == "litellm":
-            os.environ["LITELLM_TELEMETRY"] = "False"
-            import litellm
-            litellm.telemetry = False
-
-            litellm_model = self.model
-            if not any(litellm_model.startswith(p) for p in ("openai/", "azure/", "bedrock/", "vertex_ai/")):
-                litellm_model = f"openai/{litellm_model}"
-
-            resp = litellm.completion(
-                model=litellm_model,
-                messages=messages,
-                api_base=self.api_base,
-                api_key=self.api_key,
-                temperature=0,
-                timeout=120,
-            )
-            return resp.choices[0].message.content
-
-        elif self.provider == "openai":
-            if self._openai_client is None:
-                from openai import OpenAI
-                self._openai_client = OpenAI(base_url=self.api_base, api_key=self.api_key)
-
-            resp = self._openai_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0,
-                timeout=120,
-            )
-            return resp.choices[0].message.content
-
+        if images_b64:
+            content_items: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for b64 in images_b64:
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+            messages = [{"role": "user", "content": content_items}]
         else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
+            messages = [{"role": "user", "content": prompt}]
+
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            t0 = time.perf_counter()
+            try:
+                if self.provider == "litellm":
+                    os.environ["LITELLM_TELEMETRY"] = "False"
+                    import litellm
+                    litellm.telemetry = False
+                    l_model = chosen_model
+                    if not any(l_model.startswith(p) for p in ("openai/", "azure/", "bedrock/", "vertex_ai/")):
+                        l_model = f"openai/{l_model}"
+                    resp = litellm.completion(
+                        model=l_model,
+                        messages=messages,
+                        api_base=self.api_base,
+                        api_key=self.api_key,
+                        temperature=0,
+                        timeout=120,
+                    )
+                    latency = time.perf_counter() - t0
+                    tokens = getattr(resp, "usage", None)
+                    token_dict = {
+                        "prompt_tokens": getattr(tokens, "prompt_tokens", 0) if tokens else 0,
+                        "completion_tokens": getattr(tokens, "completion_tokens", 0) if tokens else 0,
+                        "total_tokens": getattr(tokens, "total_tokens", 0) if tokens else 0,
+                    }
+                    if log_llm_response is not None:
+                        log_llm_response(model=chosen_model, latency_sec=latency, status="200 OK", tokens=token_dict, logger=logger)
+                    return resp.choices[0].message.content
+                else:
+                    if self._openai_client is None:
+                        from openai import OpenAI
+                        self._openai_client = OpenAI(base_url=self.api_base, api_key=self.api_key)
+                    resp = self._openai_client.chat.completions.create(
+                        model=chosen_model,
+                        messages=messages,
+                        temperature=0,
+                        timeout=120,
+                    )
+                    latency = time.perf_counter() - t0
+                    tokens = getattr(resp, "usage", None)
+                    token_dict = {
+                        "prompt_tokens": getattr(tokens, "prompt_tokens", 0) if tokens else 0,
+                        "completion_tokens": getattr(tokens, "completion_tokens", 0) if tokens else 0,
+                        "total_tokens": getattr(tokens, "total_tokens", 0) if tokens else 0,
+                    }
+                    if log_llm_response is not None:
+                        log_llm_response(model=chosen_model, latency_sec=latency, status="200 OK", tokens=token_dict, logger=logger)
+                    return resp.choices[0].message.content or ""
+            except Exception as e:
+                latency = time.perf_counter() - t0
+                last_err = e
+                logger.warning("LLM attempt %d/%d failed: %s (latency: %.2fs)", attempt, max_retries, e, latency)
+                if attempt < max_retries:
+                    time.sleep(1.5 * attempt)
+
+        if log_llm_response is not None:
+            log_llm_response(model=chosen_model, latency_sec=0.0, status=f"Failed after {max_retries} attempts: {last_err}", logger=logger)
+        raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_err}")
 
     def extract_from_parsed(self, rec: dict, parsed: ParsedDocument) -> dict:
-        """Extracts fields from a ParsedDocument and applies node grounding."""
+        """Synchronously extracts fields using pipeline routing, schema chunking & calibration."""
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # In an active event loop, run extraction synchronously
+            return self._extract_sync(rec, parsed)
+        else:
+            async_ext = AsyncExtractor(
+                provider=self.provider,
+                model=self.model,
+                api_base=self.api_base,
+                api_key=self.api_key,
+                config=self.config,
+            )
+            return loop.run_until_complete(async_ext.extract_record_async(rec, parsed))
+
+    def _extract_sync(self, rec: dict, parsed: ParsedDocument) -> dict:
+        """Direct sync path when called inside an already-running event loop."""
+        route = determine_route(rec, parsed, self.config)
         schema = rec.get("schema", {})
-        doc_text = parsed.layout_text[:MAX_CHARS_PROMPT]
-        prompt = EXTRACTION_PROMPT.format(
-            fields=describe_schema(schema),
-            document=doc_text,
-        )
+        sub_schemas = split_schema(schema, chunk_size=self.config.schema_chunk_size)
+        sub_preds: List[Dict[str, dict]] = []
 
-        raw_reply = self.call_llm(prompt)
-        parsed_reply = parse_json_reply(raw_reply)
-
-        fields: Dict[str, Any] = {}
-        properties = schema.get("properties", {})
-
-        for field_name in properties:
-            item = parsed_reply.get(field_name)
-            if not isinstance(item, dict):
-                item = {"value": item}
-
-            val = item.get("value")
-            conf = item.get("confidence", 0.0)
-            evidence_span = item.get("evidence_span")
-
-            try:
-                conf = float(conf)
-            except (TypeError, ValueError):
-                conf = 0.0
-            conf = min(max(conf, 0.0), 1.0)
-
-            # Grounding and Calibration Guardrail
-            if val is not None:
-                # 1. Check Node Subtree Grounding
-                node_grounded = False
-                if evidence_span:
-                    node_text = parsed.get_node_text(str(evidence_span))
-                    if node_text and is_grounded(val, node_text):
-                        node_grounded = True
-
-                # 2. Check Document Raw Text Grounding
-                doc_grounded = is_grounded(val, parsed.raw_text)
-
-                if not doc_grounded:
-                    # Hallucination detected! Strictly penalize or abstain
-                    logger.info("Un-grounded value for %s: %r. Zeroing confidence.", field_name, val)
-                    conf = 0.0
-                    val = None
-                elif node_grounded:
-                    # Verified at exact canonical node location
-                    conf = min(conf, 0.99)
+        for sub_s in sub_schemas:
+            fields_desc = describe_schema(sub_s)
+            if route.modality == "vlm":
+                doc_text = route.companion_text or ""
+                prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=doc_text)
+                reply = self.call_llm(prompt, images_b64=route.images_b64, model=route.model)
+                sub_preds.append(parse_json_reply(reply))
+            else:
+                chunks = route.doc_chunks or [parsed.layout_text]
+                if len(chunks) > 1:
+                    chunk_preds = []
+                    for chunk in chunks:
+                        prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=chunk)
+                        reply = self.call_llm(prompt, model=route.model)
+                        chunk_preds.append(parse_json_reply(reply))
+                    sub_preds.append(merge_chunk_predictions(chunk_preds))
                 else:
-                    # Present in document but not in specified node
-                    conf = min(conf * 0.85, 0.90)
+                    prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=chunks[0])
+                    reply = self.call_llm(prompt, model=route.model)
+                    sub_preds.append(parse_json_reply(reply))
 
-            fields[field_name] = {
-                "value": val,
-                "confidence": round(conf, 3),
-                "evidence_span": evidence_span,
-            }
+        merged_raw = merge_schema_predictions(sub_preds)
+        calibrated = verify_and_calibrate(rec, parsed, merged_raw, self.config)
+        return {"doc_id": rec["doc_id"], "fields": calibrated}
 
-        return {"doc_id": rec["doc_id"], "fields": fields}
+
+class AsyncExtractor:
+    """Asynchronous Extractor with concurrency control, retries, and multimodal routing."""
+
+    def __init__(
+        self,
+        provider: str = "openai",
+        model: Optional[str] = None,
+        api_base: Optional[str] = None,
+        api_key: Optional[str] = None,
+        config: Optional[PipelineConfig] = None,
+    ):
+        self.provider = provider.lower()
+        self.config = config or PipelineConfig()
+        cfg_model = getattr(self.config, "model_text", None) if self.config else None
+        target_model = model or cfg_model
+        if os.environ.get("LLM_MODEL") and target_model in ("gpt-4o-mini", None):
+            target_model = os.environ.get("LLM_MODEL")
+
+        self.api_key, self.api_base, self.model = resolve_llm_config(api_key, api_base, target_model)
+        self.semaphore = asyncio.Semaphore(self.config.concurrency)
+
+        from openai import AsyncOpenAI
+        self._async_client = AsyncOpenAI(base_url=self.api_base, api_key=self.api_key or "sk-dummy")
+
+    async def call_llm_async(
+        self,
+        prompt: str,
+        images_b64: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        max_retries: int = 3,
+    ) -> str:
+        """Asynchronously invokes LLM with concurrency gating and exponential backoff."""
+        if not self.api_key:
+            raise ValueError("No API key configured for LLM. Set SIXT_LLM_KEY or LLM_API_KEY.")
+
+        chosen_model = model or self.model
+        if log_llm_request is not None:
+            log_llm_request(model=chosen_model, prompt_chars=len(prompt), logger=logger)
+
+        if images_b64:
+            content_items: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for b64 in images_b64:
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+            messages = [{"role": "user", "content": content_items}]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        last_err = None
+        async with self.semaphore:
+            for attempt in range(1, max_retries + 1):
+                t0 = time.perf_counter()
+                try:
+                    resp = await self._async_client.chat.completions.create(
+                        model=chosen_model,
+                        messages=messages,
+                        temperature=0,
+                        timeout=120,
+                    )
+                    latency = time.perf_counter() - t0
+                    tokens = getattr(resp, "usage", None)
+                    token_dict = {
+                        "prompt_tokens": getattr(tokens, "prompt_tokens", 0) if tokens else 0,
+                        "completion_tokens": getattr(tokens, "completion_tokens", 0) if tokens else 0,
+                        "total_tokens": getattr(tokens, "total_tokens", 0) if tokens else 0,
+                    }
+                    if log_llm_response is not None:
+                        log_llm_response(model=chosen_model, latency_sec=latency, status="200 OK", tokens=token_dict, logger=logger)
+                    return resp.choices[0].message.content or ""
+                except Exception as e:
+                    latency = time.perf_counter() - t0
+                    last_err = e
+                    logger.warning("Async LLM attempt %d/%d failed: %s (latency: %.2fs)", attempt, max_retries, e, latency)
+                    if attempt < max_retries:
+                        await asyncio.sleep(1.5 * attempt)
+
+        if log_llm_response is not None:
+            log_llm_response(model=chosen_model, latency_sec=0.0, status=f"Failed after {max_retries} attempts: {last_err}", logger=logger)
+        raise RuntimeError(f"Async LLM call failed after {max_retries} retries: {last_err}")
+
+    async def _extract_subschema(
+        self,
+        sub_s: dict,
+        route: RouteDecision,
+        parsed: ParsedDocument,
+    ) -> Dict[str, dict]:
+        """Extracts fields for one sub-schema, handling multimodal or document chunks."""
+        fields_desc = describe_schema(sub_s)
+
+        if route.modality == "vlm":
+            doc_text = route.companion_text or ""
+            prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=doc_text)
+            reply = await self.call_llm_async(prompt, images_b64=route.images_b64, model=route.model)
+            return parse_json_reply(reply)
+
+        chunks = route.doc_chunks or [parsed.layout_text]
+        if len(chunks) > 1:
+            chunk_tasks = []
+            for chunk in chunks:
+                prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=chunk)
+                chunk_tasks.append(self.call_llm_async(prompt, model=route.model))
+            replies = await asyncio.gather(*chunk_tasks)
+            chunk_preds = [parse_json_reply(r) for r in replies]
+            return merge_chunk_predictions(chunk_preds)
+        else:
+            prompt = EXTRACTION_PROMPT.format(fields=fields_desc, document=chunks[0])
+            reply = await self.call_llm_async(prompt, model=route.model)
+            return parse_json_reply(reply)
+
+    async def extract_record_async(self, rec: dict, parsed: ParsedDocument) -> dict:
+        """Executes full extraction pipeline for one record asynchronously."""
+        route = determine_route(rec, parsed, self.config)
+        schema = rec.get("schema", {})
+        sub_schemas = split_schema(schema, chunk_size=self.config.schema_chunk_size)
+
+        tasks = [self._extract_subschema(sub_s, route, parsed) for sub_s in sub_schemas]
+        sub_preds = await asyncio.gather(*tasks)
+
+        merged_raw = merge_schema_predictions(sub_preds)
+        calibrated = verify_and_calibrate(rec, parsed, merged_raw, self.config)
+        return {"doc_id": rec["doc_id"], "fields": calibrated}
 
 
 def offline_extract_from_parsed(rec: dict, parsed: ParsedDocument) -> dict:
@@ -296,7 +545,12 @@ def offline_extract_from_parsed(rec: dict, parsed: ParsedDocument) -> dict:
     return {"doc_id": rec["doc_id"], "fields": fields}
 
 
-def extract_document(rec: dict, extractor: Optional[Extractor] = None, mode: str = "auto") -> dict:
+def extract_document(
+    rec: dict,
+    extractor: Optional[Extractor] = None,
+    mode: str = "auto",
+    config: Optional[PipelineConfig] = None,
+) -> dict:
     """End-to-end stage separated extraction for one record:
     1. Parse with parser.py -> ParsedDocument
     2. Extract with extractor.py -> result dict
@@ -307,10 +561,67 @@ def extract_document(rec: dict, extractor: Optional[Extractor] = None, mode: str
     use_llm = mode == "llm" or (mode == "auto" and has_api_key)
 
     if use_llm:
-        ext = extractor or Extractor()
+        ext = extractor or Extractor(config=config)
         return ext.extract_from_parsed(rec, parsed)
     else:
         return offline_extract_from_parsed(rec, parsed)
+
+
+async def extract_dataset_async(
+    recs: List[dict],
+    out_path: Path,
+    config: PipelineConfig,
+    provider: str = "openai",
+    model: Optional[str] = None,
+    done_ids: Optional[set] = None,
+) -> List[dict]:
+    """Extracts a dataset of records concurrently with async checkpointing."""
+    if done_ids is None:
+        done_ids = set()
+
+    extractor = AsyncExtractor(
+        provider=provider,
+        model=model or config.model_text,
+        config=config,
+    )
+
+    results: List[dict] = []
+    t_start = time.perf_counter()
+    total = len(recs)
+    processed = 0
+
+    async def _process_one(idx: int, rec: dict) -> dict:
+        nonlocal processed
+        doc_id = rec["doc_id"]
+        if doc_id in done_ids:
+            return {"doc_id": doc_id, "skipped": True}
+
+        try:
+            parsed = parse_document(rec)
+            res = await extractor.extract_record_async(rec, parsed)
+        except Exception as e:
+            logger.exception("Async extraction error on %s: %s", doc_id, e)
+            res = {
+                "doc_id": doc_id,
+                "fields": {
+                    f: {"value": None, "confidence": 0.0, "evidence_span": None}
+                    for f in rec.get("schema", {}).get("properties", {})
+                },
+            }
+
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(res, ensure_ascii=False) + "\n")
+            f.flush()
+
+        processed += 1
+        elapsed = time.perf_counter() - t_start
+        if log_progress is not None:
+            log_progress(current=processed, total=total, elapsed_sec=elapsed, doc_id=doc_id, logger=logger)
+        return res
+
+    tasks = [_process_one(i, rec) for i, rec in enumerate(recs)]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if not r.get("skipped")]
 
 
 def main():
@@ -318,22 +629,15 @@ def main():
     parser.add_argument("--data", required=True, help="Input dataset JSONL (e.g. data/unified/dev.jsonl)")
     parser.add_argument("--out", required=True, help="Output prediction JSONL file")
     parser.add_argument("--limit", type=int, default=None, help="Process first N records")
-    parser.add_argument("--provider", choices=["litellm", "openai"], default="litellm", help="LLM backend provider")
+    parser.add_argument("--provider", choices=["litellm", "openai"], default="openai", help="LLM backend provider")
     parser.add_argument("--mode", choices=["auto", "llm", "offline"], default="auto", help="Execution mode")
     parser.add_argument("--model", default=None, help="LLM model identifier")
     parser.add_argument("--api-base", default=None, help="LLM API base URL")
     parser.add_argument("--api-key", default=None, help="LLM API key")
+    parser.add_argument("--concurrency", type=int, default=10, help="Async concurrency limit")
     args = parser.parse_args()
 
-    extractor = None
-    if args.mode != "offline":
-        extractor = Extractor(
-            provider=args.provider,
-            model=args.model,
-            api_base=args.api_base,
-            api_key=args.api_key,
-        )
-
+    cfg = PipelineConfig(concurrency=args.concurrency)
     out_path = Path(args.out)
     done_ids = set()
     if out_path.exists():
@@ -349,26 +653,26 @@ def main():
 
     print(f"Loaded {len(recs)} records. Mode: {args.mode}, Provider: {args.provider}", file=sys.stderr)
 
-    with open(out_path, "a", encoding="utf-8") as fout:
-        for i, rec in enumerate(recs):
-            doc_id = rec["doc_id"]
-            if doc_id in done_ids:
-                continue
-
-            try:
-                result = extract_document(rec, extractor=extractor, mode=args.mode)
-            except Exception as e:
-                logger.exception("Error extracting %s: %s", doc_id, e)
-                result = {
-                    "doc_id": doc_id,
-                    "fields": {f: {"value": None, "confidence": 0.0} for f in rec.get("schema", {}).get("properties", {})},
-                }
-
-            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
-            fout.flush()
-            print(f"[{i+1}/{len(recs)}] Done: {doc_id}", file=sys.stderr)
+    if args.mode == "offline":
+        with open(out_path, "a", encoding="utf-8") as fout:
+            for i, rec in enumerate(recs):
+                if rec["doc_id"] in done_ids:
+                    continue
+                result = extract_document(rec, mode="offline")
+                fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+                fout.flush()
+    else:
+        asyncio.run(
+            extract_dataset_async(
+                recs=recs,
+                out_path=out_path,
+                config=cfg,
+                provider=args.provider,
+                model=args.model,
+                done_ids=done_ids,
+            )
+        )
 
 
 if __name__ == "__main__":
     main()
-

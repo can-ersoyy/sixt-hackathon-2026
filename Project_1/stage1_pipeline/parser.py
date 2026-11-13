@@ -5,6 +5,7 @@ with canonical path annotations ([sec-1/p-2/s-5], [sec-2/table-0/row-3], etc.).
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import mimetypes
@@ -44,7 +45,16 @@ except ImportError:
         build_tree_from_markdown,
     )
 
-logger = logging.getLogger(__name__)
+try:
+    from stage1_pipeline.logging_utils import get_logger, log_document_start
+except ImportError:
+    try:
+        from logging_utils import get_logger, log_document_start
+    except ImportError:
+        get_logger = logging.getLogger
+        log_document_start = None
+
+logger = get_logger("stage1_pipeline.parser")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -71,6 +81,93 @@ class ParsedDocument:
     def get_node_text(self, path: str) -> Optional[str]:
         """Retrieve text of a node using its canonical path tag e.g. [sec-1/p-2/s-5]."""
         return self.nodes.get(path) or self.nodes.get(path.strip("[]"))
+
+    def get_node_with_neighbors(self, path: str) -> str:
+        """Retrieve text of a node along with its immediate previous and next siblings.
+        
+        Args:
+            path: Canonical path tag, e.g. '[sec-1/p-2/s-5]' or 'sec-1/p-2/s-5'.
+            
+        Returns:
+            The combined text of previous sibling (if any), current node, and
+            next sibling (if any) in its parent's children list, joined with spaces/newlines.
+            If the node has no parent, no siblings, or is only present in self.nodes,
+            falls back gracefully to self.get_node_text(path) or ''.
+        """
+        if not path:
+            return ""
+
+        fallback_text = self.get_node_text(path) or ""
+
+        if self.node_tree is None:
+            return fallback_text
+
+        # Find target node via node_tree method or fallback traversal
+        if hasattr(self.node_tree, "find_node_by_path"):
+            target_node = self.node_tree.find_node_by_path(path)
+        else:
+            target_node = self._find_node_by_path(self.node_tree, path.strip("[]"))
+
+        if not target_node or not target_node.parent:
+            return fallback_text
+
+        siblings = target_node.parent.children
+        if len(siblings) <= 1:
+            return fallback_text
+
+        try:
+            idx = siblings.index(target_node)
+        except ValueError:
+            return fallback_text
+
+        prev_node = siblings[idx - 1] if idx > 0 else None
+        next_node = siblings[idx + 1] if idx + 1 < len(siblings) else None
+
+        if prev_node is None and next_node is None:
+            return fallback_text
+
+        def _get_text(n: Node) -> str:
+            # Check self.nodes first for consistency with get_node_text
+            txt = self.get_node_text(n.canonical_path)
+            if txt and txt.strip():
+                return txt.strip()
+            if n.text and n.text.strip():
+                return n.text.strip()
+            return n.to_raw_text().strip()
+
+        ordered_nodes = []
+        if prev_node is not None:
+            ordered_nodes.append(prev_node)
+        ordered_nodes.append(target_node)
+        if next_node is not None:
+            ordered_nodes.append(next_node)
+
+        texts = []
+        for n in ordered_nodes:
+            t = _get_text(n)
+            if t:
+                texts.append(t)
+
+        if not texts:
+            return fallback_text
+
+        all_sentences = all(getattr(n, "node_type", "") == "sentence" for n in ordered_nodes)
+        any_newline = any("\n" in t for t in texts)
+        if all_sentences and not any_newline:
+            return " ".join(texts)
+        elif any_newline or any(getattr(n, "node_type", "") in ("table_row", "table", "section", "paragraph") for n in ordered_nodes):
+            return "\n".join(texts)
+        else:
+            return " ".join(texts)
+
+    def _find_node_by_path(self, node: Node, target_clean: str) -> Optional[Node]:
+        if node.canonical_path.strip("[]") == target_clean:
+            return node
+        for child in node.children:
+            res = self._find_node_by_path(child, target_clean)
+            if res is not None:
+                return res
+        return None
 
 
 def load_cuad_corpus() -> Dict[str, str]:
@@ -240,6 +337,15 @@ def parse_document(rec: dict) -> ParsedDocument:
         metadata["parser"] = "cuad_corpus"
         metadata["char_count"] = len(raw_content)
 
+        if log_document_start is not None:
+            log_document_start(
+                doc_id=doc_id,
+                doc_type=doc_type,
+                pages=1,
+                chars=len(raw_content),
+                logger=logger,
+            )
+
         tree = build_tree_from_markdown(raw_content)
         annotated = tree.to_annotated_text()
         index = tree.build_index()
@@ -288,6 +394,15 @@ def parse_document(rec: dict) -> ParsedDocument:
     raw_text = md_text or ""
     metadata["char_count"] = len(raw_text)
 
+    if log_document_start is not None:
+        log_document_start(
+            doc_id=doc_id,
+            doc_type=doc_type,
+            pages=page_count,
+            chars=len(raw_text),
+            logger=logger,
+        )
+
     # Build Hierarchical Node Tree
     tree = build_tree_from_markdown(raw_text)
     annotated = tree.to_annotated_text()
@@ -306,4 +421,84 @@ def parse_document(rec: dict) -> ParsedDocument:
         node_tree=tree,
         tables=tables_data,
     )
+
+
+def render_pdf_pages_base64(
+    pdf_path: Path | str,
+    max_pages: int = 10,
+    dpi: int = 150,
+    as_data_uri: bool = False,
+) -> List[str]:
+    """Render PDF pages (or load image files) as base64 strings.
+    
+    Args:
+        pdf_path: Path to PDF document or image file (.png, .jpg, etc.).
+        max_pages: Maximum number of pages to render (for multi-page PDFs).
+        dpi: Resolution for PDF rasterization (default: 150 DPI).
+        as_data_uri: If True, prefix with 'data:<mime>;base64,'. Default False.
+        
+    Returns:
+        List of base64 strings (one per page or single element for an image).
+    """
+    path = Path(pdf_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    ext = path.suffix.lower()
+    image_exts = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+
+    # Handle image files directly
+    if ext in image_exts:
+        img_bytes = path.read_bytes()
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        if as_data_uri:
+            mime = mimetypes.guess_type(str(path))[0] or "image/png"
+            return [f"data:{mime};base64,{b64}"]
+        return [b64]
+
+    images_b64: List[str] = []
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        try:
+            import fitz
+        except ImportError:
+            fitz = None
+
+    if fitz is not None:
+        try:
+            with fitz.open(str(path)) as doc:
+                num_pages = min(len(doc), max_pages)
+                for page_idx in range(num_pages):
+                    page = doc[page_idx]
+                    pix = page.get_pixmap(dpi=dpi)
+                    png_bytes = pix.tobytes("png")
+                    b64 = base64.b64encode(png_bytes).decode("utf-8")
+                    if as_data_uri:
+                        images_b64.append(f"data:image/png;base64,{b64}")
+                    else:
+                        images_b64.append(b64)
+            return images_b64
+        except Exception as e:
+            logger.warning("pymupdf rendering failed for %s: %s", path, e)
+
+    # Fallback to pdf2image
+    try:
+        from pdf2image import convert_from_path
+        import io
+        pages = convert_from_path(str(path), first_page=1, last_page=max_pages, dpi=dpi)
+        for page in pages:
+            buf = io.BytesIO()
+            page.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            if as_data_uri:
+                images_b64.append(f"data:image/png;base64,{b64}")
+            else:
+                images_b64.append(b64)
+        return images_b64
+    except Exception as e:
+        logger.warning("pdf2image rendering fallback failed for %s: %s", path, e)
+
+    return images_b64
+
 

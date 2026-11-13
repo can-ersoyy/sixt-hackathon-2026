@@ -56,6 +56,47 @@ class Node:
             child.build_index(index)
         return index
 
+    def find_node_by_path(self, path: str) -> Optional[Node]:
+        """Find a node in this subtree matching the canonical path tag.
+        
+        Supports paths with or without brackets, e.g. '[sec-1/p-2/s-5]' or 'sec-1/p-2/s-5'.
+        """
+        clean = path.strip("[]").strip()
+        if not clean:
+            return None
+        if clean == "root" or clean == self.id:
+            return self
+
+        parts = [p for p in clean.split("/") if p]
+        if parts and parts[0] == "root" and self.id == "root":
+            parts = parts[1:]
+        if not parts:
+            return self
+
+        # Direct descent via child IDs
+        curr = self
+        for part in parts:
+            matched = None
+            for child in curr.children:
+                if child.id == part:
+                    matched = child
+                    break
+            if matched is None:
+                # Fallback to search subtree by canonical_path
+                return self._find_by_canonical_path(clean)
+            curr = matched
+        return curr
+
+    def _find_by_canonical_path(self, clean_path: str) -> Optional[Node]:
+        """Recursive helper matching canonical path without brackets."""
+        if self.canonical_path.strip("[]") == clean_path:
+            return self
+        for child in self.children:
+            found = child._find_by_canonical_path(clean_path)
+            if found is not None:
+                return found
+        return None
+
 
 class SectionNode(Node):
     """Section / Article / Heading level node."""

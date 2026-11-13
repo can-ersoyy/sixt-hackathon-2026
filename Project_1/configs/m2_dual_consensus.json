@@ -1,0 +1,18 @@
+{
+  "name": "m2_dual_consensus",
+  "description": "Dual-Pass Fast Consensus: Pass 1 (gemini-3.5-flash-lite); Pass 2 (gemini-3.5-flash on non-null fields with values_match boost/penalty)",
+  "route_mode": "auto",
+  "vlm_max_pages": 3,
+  "max_doc_chars": 60000,
+  "chunk_overlap_chars": 5000,
+  "schema_chunk_size": 10,
+  "concurrency": 3,
+  "model_text": "gemini-3.8-flash",
+  "model_vlm": "gemini-3.8-flash",
+  "pass2_strategy": "complementary_or_second_model",
+  "model_pass2": "gemini-3.5-flash",
+  "boost_conf": 0.97,
+  "penalty_mult": 0.40,
+  "risk_json_mult": 0.90,
+  "risk_corrupted_mult": 0.85
+}
